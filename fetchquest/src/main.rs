@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use clap::{ArgEnum, Parser};
-use reqwest::{header, Client, Method};
-use std::{
-    fs::File,
-    io::{self, Write},
+use futures::stream::TryStreamExt;
+use reqwest::{
+    header,
+    multipart::{Form, Part},
+    Body, Client, Method,
 };
+use std::path::PathBuf;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -39,6 +44,12 @@ struct Args {
     #[clap(short = 'H', long)]
     header: Vec<String>,
 
+    #[clap(short = 'F', long)]
+    form_file: Option<PathBuf>,
+
+    #[clap(short = 'd', long)]
+    data: Option<String>,
+
     url: String,
 }
 
@@ -49,6 +60,7 @@ enum RequestMethod {
     Put,
     Delete,
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -74,21 +86,60 @@ async fn main() -> Result<()> {
         }
     }
 
-    let res = request.send().await.context("Failed to send request")?;
+    if let Some(form_path) = args.form_file {
+        let file = File::open(&form_path)
+            .await
+            .context("Failed to open file for upload")?;
+        let stream = FramedRead::new(file, BytesCodec::new()).map_ok(|bytes| bytes.freeze());
+        let body = Body::wrap_stream(stream);
+        let part = Part::stream(body)
+            .file_name(form_path.file_name().unwrap().to_string_lossy().to_string())
+            .mime_str("application/octet-stream")?; // or set MIME type based on the file type
 
-    let mut output: Box<dyn Write> = if let Some(file_path) = args.output {
-        Box::new(File::create(&file_path).context("Failed to create file")?)
-    } else {
-        Box::new(io::stdout())
-    };
-
-    if args.include_headers {
-        writeln!(output, "{:?}", res.headers()).context("Failed to write headers")?;
+        let form = Form::new().part("file", part);
+        request = request.multipart(form);
     }
 
-    if !args.head {
-        let body = res.text().await.context("Failed to load response body")?;
-        writeln!(output, "{}", body).context("Failed to write body")?;
+    if let Some(data) = args.data {
+        request = request.body(data);
+    }
+
+    let res = request.send().await.context("Failed to send request")?;
+
+    if args.silent {
+        return Ok(());
+    }
+
+    if let Some(file_path) = args.output {
+        let mut file = File::create(&file_path)
+            .await
+            .context("Failed to create file")?;
+        if args.include_headers {
+            file.write_all(format!("{:?}\n", res.headers()).as_bytes())
+                .await
+                .context("Failed to write headers")?;
+        }
+        if !args.head {
+            let body = res.text().await.context("Failed to load response body")?;
+            file.write_all(body.as_bytes())
+                .await
+                .context("Failed to write body")?;
+        }
+    } else {
+        let mut stdout = tokio::io::stdout();
+        if args.include_headers {
+            stdout
+                .write_all(format!("{:?}\n", res.headers()).as_bytes())
+                .await
+                .context("Failed to write headers")?;
+        }
+        if !args.head {
+            let body = res.text().await.context("Failed to load response body")?;
+            stdout
+                .write_all(body.as_bytes())
+                .await
+                .context("Failed to write body")?;
+        }
     }
 
     Ok(())
