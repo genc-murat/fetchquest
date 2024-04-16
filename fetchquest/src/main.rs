@@ -6,7 +6,7 @@ use futures::stream::TryStreamExt;
 use reqwest::{
     header,
     multipart::{Form, Part},
-    Body, Client, ClientBuilder, Method,
+    Body, Client, Method,
 };
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
