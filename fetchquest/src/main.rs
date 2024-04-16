@@ -1,12 +1,13 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use clap::{ArgEnum, Parser};
 use futures::stream::TryStreamExt;
 use reqwest::{
     header,
     multipart::{Form, Part},
-    Body, Client, Method,
+    Body, Client, ClientBuilder, Method,
 };
-use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
@@ -14,41 +15,47 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short = 'I', long)]
+    #[clap(short, long)]
     head: bool,
 
-    #[clap(short = 'i', long)]
+    #[clap(short, long)]
     include_headers: bool,
 
-    #[clap(short = 'A', long, default_value = "RustHttpClient/0.1.0")]
+    #[clap(short, long, default_value = "RustHttpClient/0.1.0")]
     user_agent: String,
 
-    #[clap(short = 'X', long, arg_enum, default_value = "get")]
+    #[clap(short, long, arg_enum, default_value = "get")]
     request_type: RequestMethod,
 
-    #[clap(short = 'L', long)]
+    #[clap(short, long)]
     follow_redirects: bool,
 
-    #[clap(short = 'b', long)]
+    #[clap(short, long)]
     cookie: Option<String>,
 
-    #[clap(short = 'v', long)]
+    #[clap(short, long)]
     verbose: bool,
 
-    #[clap(short = 's', long)]
+    #[clap(short, long)]
     silent: bool,
 
-    #[clap(short = 'o', long)]
+    #[clap(short, long)]
     output: Option<String>,
 
-    #[clap(short = 'H', long)]
+    #[clap(short, long)]
     header: Vec<String>,
 
-    #[clap(short = 'F', long)]
+    #[clap(short, long)]
     form_file: Option<PathBuf>,
 
-    #[clap(short = 'd', long)]
+    #[clap(short, long)]
     data: Option<String>,
+
+    #[clap(short, long, help = "Disable SSL/TLS certificate validation")]
+    disable_ssl_verification: bool,
+
+    #[clap(short, long, help = "Bearer token for authentication (OAuth2 or JWT)")]
+    bearer_token: Option<String>,
 
     url: String,
 }
@@ -64,14 +71,21 @@ enum RequestMethod {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let client = Client::builder()
-        .user_agent(args.user_agent)
-        .redirect(if args.follow_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        })
-        .build()?;
+
+    let mut client_builder =
+        Client::builder()
+            .user_agent(args.user_agent)
+            .redirect(if args.follow_redirects {
+                reqwest::redirect::Policy::limited(10)
+            } else {
+                reqwest::redirect::Policy::none()
+            });
+
+    if args.disable_ssl_verification {
+        client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = client_builder.build()?;
 
     let mut request = client.request(Method::from(args.request_type), &args.url);
 
@@ -86,6 +100,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(token) = args.bearer_token {
+        request = request.bearer_auth(token);
+    }
+
     if let Some(form_path) = args.form_file {
         let file = File::open(&form_path)
             .await
@@ -94,7 +112,7 @@ async fn main() -> Result<()> {
         let body = Body::wrap_stream(stream);
         let part = Part::stream(body)
             .file_name(form_path.file_name().unwrap().to_string_lossy().to_string())
-            .mime_str("application/octet-stream")?; // or set MIME type based on the file type
+            .mime_str("application/octet-stream")?;
 
         let form = Form::new().part("file", part);
         request = request.multipart(form);
